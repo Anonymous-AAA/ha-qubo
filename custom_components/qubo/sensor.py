@@ -42,14 +42,14 @@ SENSOR_TYPES = [
     },
     {
         "key": "consumption",
-        "name": "Consumption",
+        "name": "Consumption Today",
         "device_class": SensorDeviceClass.ENERGY,
         "unit": UnitOfEnergy.KILO_WATT_HOUR,
         "state_class": SensorStateClass.TOTAL_INCREASING,
     },
     {
         "key": "duration",
-        "name": "Time On",
+        "name": "Time On Today",
         "device_class": SensorDeviceClass.DURATION,
         "unit": UnitOfTime.MINUTES,
         "state_class": SensorStateClass.TOTAL_INCREASING,
