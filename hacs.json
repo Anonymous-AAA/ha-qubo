@@ -1,6 +1,5 @@
 {
   "name": "Qubo Smart Plug",
   "render_readme": true,
-  "iot_class": "cloud_push",
   "filename": "qubo"
 }
