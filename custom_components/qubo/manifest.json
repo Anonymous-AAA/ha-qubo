@@ -8,5 +8,5 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/Anonymous-AAA/ha-qubo/issues",
   "requirements": ["paho-mqtt>=1.6.1"],
-  "version": "0.1.2"
+  "version": "0.1.3"
 }
