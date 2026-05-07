@@ -12,7 +12,7 @@ import paho.mqtt.client as mqtt
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import BASE_URL,LOGIN_DEVICE_NAME
+from .const import BASE_URL, LOGIN_DEVICE_NAME
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -125,11 +125,17 @@ class QuboHub:
                 if metrics_data:
                     self.metrics["power"] = float(metrics_data.get("power", 0))
                     self.metrics["current"] = float(metrics_data.get("current", 0))
-                    self.metrics["voltage"] = float(metrics_data.get("voltage", 0))
+                    # self.metrics["voltage"] = float(metrics_data.get("voltage", 0))
                     self.metrics["consumption"] = float(
                         metrics_data.get("consumption", 0)
                     )
                     self.metrics["duration"] = int(metrics_data.get("duration", 0))
+
+                    # Prevent zero-voltage drops from hitting the dashboard
+                    new_voltage = float(metrics_data.get("voltage", 0))
+                    if new_voltage > 0:
+                        self.metrics["voltage"] = new_voltage
+
                     self.hass.loop.call_soon_threadsafe(self._publish_update)
         except json.JSONDecodeError, ValueError, KeyError, TypeError:
             pass
