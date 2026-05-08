@@ -133,7 +133,11 @@ class QuboHub:
 
                     # Prevent zero-voltage drops from hitting the dashboard
                     new_voltage = float(metrics_data.get("voltage", 0))
-                    if new_voltage > 0:
+
+                    # If the voltage is above 50V, it's a real reading.
+                    # If it's below 50V (like 0.11V or 0V), it's a sensor glitch,
+                    # so we ignore it and keep the last known good value.
+                    if new_voltage > 50:
                         self.metrics["voltage"] = new_voltage
 
                     self.hass.loop.call_soon_threadsafe(self._publish_update)
