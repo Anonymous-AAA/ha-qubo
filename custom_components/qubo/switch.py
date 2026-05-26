@@ -43,6 +43,12 @@ class QuboSwitch(SwitchEntity):
         """Return whether polling is required for this entity."""
         return False
 
+    @property
+    def available(self) -> bool:
+        """Return True if the plug is online."""
+        return self._hub.available
+
+
     async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
         await self._hub.turn_on()

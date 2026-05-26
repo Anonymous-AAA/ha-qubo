@@ -135,9 +135,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 # 2. Extract Initial State from Device Shadow
                 initial_state = False
+                initial_availability = False
                 shadows = sync_data.get("deviceshadow", [])
                 for shadow in shadows:
                     if shadow.get("deviceUUID") == device_uuid:
+                        op_state_value = shadow.get("operationState", {}).get("value")
+                        initial_availability = (op_state_value == "online")
+
                         services = shadow.get("services", [])
                         for service in services:
                             if service.get("service") == "lcSwitchControl":
@@ -166,7 +170,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         initial_state,
         device_name,
         handle_name,
-        client_id  # Pass the client_id to the Hub
+        client_id,  # Pass the client_id to the Hub
+        initial_availability
     )
     await hub.start()
 

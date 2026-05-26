@@ -100,6 +100,11 @@ class QuboSensor(SensorEntity):
         """Return False as updates are handled via MQTT callbacks."""
         return False
 
+    @property
+    def available(self) -> bool:
+        """Return True if the plug is online."""
+        return self._hub.available
+
     async def async_added_to_hass(self):
         """Listen for MQTT updates from the Hub."""
         self._hub.register_callback(self.async_write_ha_state)

@@ -34,6 +34,7 @@ class QuboHub:
         device_name,
         handle_name,
         client_id,  # Accept the client_id in the constructor
+        initial_availability
     ) -> None:
         """Initialize the Qubo hub."""
         self.hass = hass
@@ -50,6 +51,7 @@ class QuboHub:
         self._client_id = client_id
 
         self.state = initial_state
+        self.available = initial_availability
         self.metrics = {
             "power": None,
             "current": None,
@@ -70,6 +72,7 @@ class QuboHub:
             f"/control/{unit_uuid}/{device_uuid}/meteringRefresh"
         )
         self._topic_monitor_meter = f"/monitor/{unit_uuid}/{device_uuid}/plugMetering"
+        self._topic_monitor_heartbeat = f"/monitor/{unit_uuid}/{device_uuid}/heartbeat"
 
         self._mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
         # self._mqtt_client.tls_set(cert_reqs=ssl.CERT_NONE)
@@ -94,7 +97,7 @@ class QuboHub:
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             client.subscribe(
-                [(self._topic_monitor_switch, 0), (self._topic_monitor_meter, 0)]
+                [(self._topic_monitor_switch, 0), (self._topic_monitor_meter, 0),(self._topic_monitor_heartbeat, 0)]
             )
 
     def _on_message(self, client, userdata, msg):
@@ -141,6 +144,17 @@ class QuboHub:
                         self.metrics["voltage"] = new_voltage
 
                     self.hass.loop.call_soon_threadsafe(self._publish_update)
+
+            elif topic == self._topic_monitor_heartbeat:
+                operation_state = payload.get("devices", {}).get("operationState")
+                if operation_state:
+                    # Update status and notify HA if it changed
+                    is_available = (operation_state == "online")
+                    if self.available != is_available:
+                        self.available = is_available
+                        _LOGGER.debug(f"Qubo plug went {'online' if is_available else 'offline'}")
+                        self.hass.loop.call_soon_threadsafe(self._publish_update)
+
         except json.JSONDecodeError, ValueError, KeyError, TypeError:
             pass
 
