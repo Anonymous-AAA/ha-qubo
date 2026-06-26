@@ -163,7 +163,9 @@ class QuboHub:
 
         def connect_mqtt():
 
-            self._mqtt_client.tls_set(cert_reqs=ssl.CERT_NONE)
+            # Create a secure, default context that enforces certificate and hostname verification
+            context = ssl.create_default_context()
+            self._mqtt_client.tls_set_context(context)
 
             self._mqtt_client.connect("mqtt.platform.quboworld.com", 8883, 60)
             self._mqtt_client.loop_start()
