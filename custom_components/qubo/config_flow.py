@@ -9,7 +9,15 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import BASE_URL, CONF_PASSWORD, CONF_USERNAME, DOMAIN,LOGIN_DEVICE_NAME,DEVICE_ATTRIBUTE,APP_ID
+from .const import (
+    APP_ID,
+    BASE_URL,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    DEVICE_ATTRIBUTE,
+    DOMAIN,
+    LOGIN_DEVICE_NAME,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,7 +33,7 @@ DATA_SCHEMA = vol.Schema(
 async def validate_input(hass: HomeAssistant, data: dict) -> dict:
     """Validate the user input allows us to connect."""
     session = async_get_clientsession(hass)
-    login_url = f"{BASE_URL}/sms/api/v4/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/login"
+    login_url = f"{BASE_URL}sms/api/v4/sp/d10e4bfb0153496e8e8bb955f7ebe413/user/login"
 
     payload = {
         "accessToken": "",
@@ -49,16 +57,30 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict:
     }
     params = {"system": "CS"}
 
-    async with session.post(
-        login_url, json=payload, headers=headers, params=params
-    ) as response:
-        if response.status in {401, 403}:
-            raise InvalidAuth
-        if response.status >= 400:
-            raise CannotConnect
+    _LOGGER.debug("Attempting to login to Qubo with URL: %s", login_url)
+    # Don't log password or full payload to avoid leaking credentials
+    _LOGGER.debug("Login headers: %s", headers)
 
-        # If we get here, credentials are valid!
-        return {"title": data[CONF_USERNAME],"client_id": client_id}
+    try:
+        async with session.post(
+            login_url, json=payload, headers=headers, params=params
+        ) as response:
+            _LOGGER.debug("Login response status: %s", response.status)
+            
+            if response.status >= 400:
+                response_text = await response.text()
+                _LOGGER.error("Login failed with status %s. Response: %s", response.status, response_text)
+                
+            if response.status in {401, 403}:
+                raise InvalidAuth
+            if response.status >= 400:
+                raise CannotConnect
+
+            # If we get here, credentials are valid!
+            return {"title": data[CONF_USERNAME], "client_id": client_id}
+    except Exception as err:
+        _LOGGER.error("Exception during Qubo login: %s", err)
+        raise
 
 
 class QuboConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):

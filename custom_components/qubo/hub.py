@@ -96,14 +96,18 @@ class QuboHub:
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
+            _LOGGER.debug("Successfully connected to Qubo MQTT broker")
             client.subscribe(
                 [(self._topic_monitor_switch, 0), (self._topic_monitor_meter, 0),(self._topic_monitor_heartbeat, 0)]
             )
+        else:
+            _LOGGER.error("Failed to connect to Qubo MQTT broker, return code %s", rc)
 
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
             topic = msg.topic
+            _LOGGER.debug("Received MQTT message on topic %s: %s", topic, payload)
 
             if topic == self._topic_monitor_switch:
                 state_data = (
@@ -114,8 +118,12 @@ class QuboHub:
                     .get("stateChanged", {})
                 )
                 if "power" in state_data:
+                    _LOGGER.debug("Updating switch state to: %s", state_data["power"])
+                    self.available = True  # If we got a message, it's online
                     self.state = state_data["power"] == "on"
                     self.hass.loop.call_soon_threadsafe(self._publish_update)
+                else:
+                    _LOGGER.debug("No 'power' attribute in switch state_data: %s", state_data)
 
             elif topic == self._topic_monitor_meter:
                 metrics_data = (
@@ -126,6 +134,8 @@ class QuboHub:
                     .get("stateChanged", {})
                 )
                 if metrics_data:
+                    _LOGGER.debug("Updating metrics with: %s", metrics_data)
+                    self.available = True  # If we got metrics, it's online
                     self.metrics["power"] = float(metrics_data.get("power", 0))
                     self.metrics["current"] = float(metrics_data.get("current", 0))
                     # self.metrics["voltage"] = float(metrics_data.get("voltage", 0))
@@ -144,6 +154,8 @@ class QuboHub:
                         self.metrics["voltage"] = new_voltage
 
                     self.hass.loop.call_soon_threadsafe(self._publish_update)
+                else:
+                    _LOGGER.debug("No stateChanged data found in plugMetering payload")
 
             elif topic == self._topic_monitor_heartbeat:
                 operation_state = payload.get("devices", {}).get("operationState")
@@ -154,9 +166,13 @@ class QuboHub:
                         self.available = is_available
                         _LOGGER.debug(f"Qubo plug went {'online' if is_available else 'offline'}")
                         self.hass.loop.call_soon_threadsafe(self._publish_update)
+                else:
+                    _LOGGER.debug("No operationState found in heartbeat payload")
 
-        except json.JSONDecodeError, ValueError, KeyError, TypeError:
-            pass
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as err:
+            _LOGGER.error("Error processing MQTT message: %s. Payload: %s", err, msg.payload)
+        except Exception as err:
+            _LOGGER.error("Unexpected error in _on_message: %s", err)
 
     async def start(self):
         """Start the MQTT connection and begin periodic metric refreshes."""
@@ -309,6 +325,7 @@ class QuboHub:
         self._mqtt_client.publish(self._topic_control_switch, json.dumps(payload))
 
     async def _send_meter_refresh(self, now=None):
+        _LOGGER.debug("Requesting meter refresh for Qubo device %s", self.device_uuid)
         await self._async_refresh_token_if_needed()
         payload = {
             "command": {
@@ -328,4 +345,5 @@ class QuboHub:
             "srcDeviceId": self._client_id,  # Use the client_id we saved from the config flow
             "timestamp": int(time.time() * 1000),
         }
+        _LOGGER.debug("Publishing meter refresh payload to topic %s: %s", self._topic_control_meter, payload)
         self._mqtt_client.publish(self._topic_control_meter, json.dumps(payload))

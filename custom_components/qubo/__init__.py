@@ -9,7 +9,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import BASE_URL, CONF_PASSWORD, CONF_USERNAME, DOMAIN, LOGIN_DEVICE_NAME,DEVICE_ATTRIBUTE,APP_ID
+from .const import (
+    APP_ID,
+    BASE_URL,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    DEVICE_ATTRIBUTE,
+    DOMAIN,
+    LOGIN_DEVICE_NAME,
+)
 from .hub import QuboHub
 
 _LOGGER = logging.getLogger(__name__)
