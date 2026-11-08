@@ -8,8 +8,8 @@ This integration connects directly to Qubo's cloud servers and establishes a per
 * **UI Setup:** Fully configure the integration via the Home Assistant UI (Config Flow). No `configuration.yaml` editing required!
 * **Instant Control:** Toggle your smart plug on and off instantly.
 * **Energy Monitoring:** Live tracking of Power, Current, Voltage, and total energy consumption.
-* **Stable Connection:** Proactive background token refreshing prevents the connection from silently dropping.
-* **Auto-Discovery:** Automatically fetches your Device UUIDs and sets everything up.
+* **Session management:** Email and phone sessions can refresh in the background; rejected or older phone sessions require another SMS code.
+* **Auto-Discovery:** Automatically discovers supported plugs and uses their Qubo names in Home Assistant.
 
 ## 🔌 Supported Devices
 * Qubo Smart Plug 10A (Model: HSP02 / HSP02A)
@@ -39,11 +39,13 @@ This is the easiest way to install and keep the integration updated.
 1. In the Home Assistant UI, go to **Settings** -> **Devices & Services**.
 2. Click the **+ Add Integration** button in the bottom right corner.
 3. Search for **Qubo Smart Plug**.
-4. Enter your Qubo app **Email address** and **Password**.
-5. Click Submit. The integration will automatically discover your plug and create the device!
+4. Choose **password** or **phone**. For password, enter your Qubo account email and password. For phone, enter the digits and country calling code (for example `+91`), then enter the SMS code in Home Assistant. If several accounts match, select the account that owns your plug.
+5. The integration will discover the supported plugs on the selected account and create their entities.
+
+**Phone sessions:** The integration exchanges the OTP result for a renewable session and stores the resulting access and refresh tokens in Home Assistant's configuration. Existing phone entries created before this change must complete SMS reauthentication to obtain a refresh token. If refresh credentials are rejected, another SMS login is required. This uses unofficial Qubo endpoints and the exchange has not yet been validated against a live account. Do not share one-time codes or session tokens; protect your Home Assistant configuration and backups.
 
 ## 📊 Entities Created
-Once configured, the integration will create a single Device containing the following entities:
+Once configured, the integration will create a Home Assistant device for each discovered plug, with the following entities:
 
 | Entity Type | Description | Unit |
 | :--- | :--- | :--- |
