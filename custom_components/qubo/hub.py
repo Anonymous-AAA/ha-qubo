@@ -1,8 +1,10 @@
 """Qubo hub integration helper for Home Assistant."""
 
+import asyncio
 from datetime import timedelta
 import json
 import logging
+import math
 import ssl
 import time
 
@@ -12,9 +14,23 @@ import paho.mqtt.client as mqtt
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import BASE_URL, LOGIN_DEVICE_NAME
+from .session import SessionRejected, persist_phone_session, refresh_credentials
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class QuboHubError(RuntimeError):
+    """A refresh or lifecycle failure that prevents command publication."""
+
+
+class QuboSession:
+    """Share account credentials and serialize refresh across plug connections."""
+
+    def __init__(self, access_token, refresh_token, expires_at):
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.expires_at = expires_at
+        self.lock = asyncio.Lock()
 
 
 class QuboHub:
@@ -34,7 +50,8 @@ class QuboHub:
         device_name,
         handle_name,
         client_id,  # Accept the client_id in the constructor
-        initial_availability
+        initial_availability,
+        *, entry=None, phone_auth=False, auth=None
     ) -> None:
         """Initialize the Qubo hub."""
         self.hass = hass
@@ -42,6 +59,16 @@ class QuboHub:
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._expires_at = expires_at
+        self._auth = auth
+        self._lifecycle_lock = auth.lock if auth is not None else asyncio.Lock()
+        self._stopped = False
+        self._entry = entry
+        self._phone_auth = phone_auth
+        self._reauth_started = False
+        self._mqtt_auth_rejected = False
+        self._last_reauth_attempt = None
+        self._mqtt_needs_restart = False
+        self._mqtt_tls_configured = False
 
         self._user_uuid = user_uuid
         self.device_uuid = device_uuid
@@ -95,6 +122,17 @@ class QuboHub:
             callback()
 
     def _on_connect(self, client, userdata, flags, rc):
+        if self._phone_auth and rc in (4, 5):
+            # Paho invokes this on its network thread. Fail closed immediately,
+            # then serialize shutdown and reauth on the HA event loop.
+            self._mqtt_auth_rejected = True
+            try:
+                self.hass.loop.call_soon_threadsafe(self._schedule_mqtt_auth_failure)
+            except RuntimeError:
+                pass  # The HA event loop is already closed.
+            return
+        if self._phone_auth and (self._reauth_started or self._mqtt_auth_rejected or time.time() >= self._expires_at):
+            return
         if rc == 0:
             _LOGGER.debug("Successfully connected to Qubo MQTT broker")
             client.subscribe(
@@ -103,180 +141,280 @@ class QuboHub:
         else:
             _LOGGER.error("Failed to connect to Qubo MQTT broker, return code %s", rc)
 
-    def _on_message(self, client, userdata, msg):
+    def _schedule_mqtt_auth_failure(self):
+        """Schedule rejection handling on the HA loop, not Paho's thread."""
+        if not self._stopped:
+            self.hass.async_create_task(self._handle_mqtt_auth_failure())
+
+    async def _handle_mqtt_auth_failure(self):
         try:
-            payload = json.loads(msg.payload.decode("utf-8"))
+            async with self._lifecycle_lock:
+                if not self._stopped:
+                    await self._expire_phone_session()
+        except Exception:
+            _LOGGER.exception("Unable to handle Qubo MQTT authentication failure")
+
+    @staticmethod
+    def _mqtt_object(data, *path):
+        """Read an optional object path, rejecting non-object containers."""
+        if not isinstance(data, dict):
+            raise ValueError("Expected an object")
+        for key in path:
+            data = data.get(key, {})
+            if not isinstance(data, dict):
+                raise ValueError("Expected an object")
+        return data
+
+    @staticmethod
+    def _mqtt_number(value):
+        """Accept numeric wire values, but not booleans or invalid readings."""
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError("Expected a number")
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("Expected a finite nonnegative number")
+        return number
+
+    @staticmethod
+    def _reject_json_constant(value):
+        """Reject nonstandard JSON constants without exposing input in logs."""
+        raise ValueError("Invalid JSON constant")
+
+    def _on_message(self, client, userdata, msg):
+        # Filter before decoding: only these exact topics are subscribed.
+        try:
             topic = msg.topic
-            _LOGGER.debug("Received MQTT message on topic %s: %s", topic, payload)
-
-            if topic == self._topic_monitor_switch:
-                state_data = (
-                    payload.get("devices", {})
-                    .get("services", {})
-                    .get("lcSwitchControl", {})
-                    .get("events", {})
-                    .get("stateChanged", {})
-                )
-                if "power" in state_data:
-                    _LOGGER.debug("Updating switch state to: %s", state_data["power"])
-                    self.available = True  # If we got a message, it's online
-                    self.state = state_data["power"] == "on"
-                    self.hass.loop.call_soon_threadsafe(self._publish_update)
-                else:
-                    _LOGGER.debug("No 'power' attribute in switch state_data: %s", state_data)
-
-            elif topic == self._topic_monitor_meter:
-                metrics_data = (
-                    payload.get("devices", {})
-                    .get("services", {})
-                    .get("plugMetering", {})
-                    .get("events", {})
-                    .get("stateChanged", {})
-                )
-                if metrics_data:
-                    _LOGGER.debug("Updating metrics with: %s", metrics_data)
-                    self.available = True  # If we got metrics, it's online
-                    self.metrics["power"] = float(metrics_data.get("power", 0))
-                    self.metrics["current"] = float(metrics_data.get("current", 0))
-                    # self.metrics["voltage"] = float(metrics_data.get("voltage", 0))
-                    self.metrics["consumption"] = float(
-                        metrics_data.get("consumption", 0)
-                    )
-                    self.metrics["duration"] = int(metrics_data.get("duration", 0))
-
-                    # Prevent zero-voltage drops from hitting the dashboard
-                    new_voltage = float(metrics_data.get("voltage", 0))
-
-                    # If the voltage is above 50V, it's a real reading.
-                    # If it's below 50V (like 0.11V or 0V), it's a sensor glitch,
-                    # so we ignore it and keep the last known good value.
-                    if new_voltage > 50:
-                        self.metrics["voltage"] = new_voltage
-
-                    self.hass.loop.call_soon_threadsafe(self._publish_update)
-                else:
-                    _LOGGER.debug("No stateChanged data found in plugMetering payload")
-
-            elif topic == self._topic_monitor_heartbeat:
-                operation_state = payload.get("devices", {}).get("operationState")
-                if operation_state:
-                    # Update status and notify HA if it changed
-                    is_available = (operation_state == "online")
-                    if self.available != is_available:
-                        self.available = is_available
-                        _LOGGER.debug(f"Qubo plug went {'online' if is_available else 'offline'}")
-                        self.hass.loop.call_soon_threadsafe(self._publish_update)
-                else:
-                    _LOGGER.debug("No operationState found in heartbeat payload")
-
-        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as err:
-            _LOGGER.error("Error processing MQTT message: %s. Payload: %s", err, msg.payload)
-        except Exception as err:
-            _LOGGER.error("Unexpected error in _on_message: %s", err)
-
-    async def start(self):
-        """Start the MQTT connection and begin periodic metric refreshes."""
-
-        def connect_mqtt():
-
-            # Create a secure, default context that enforces certificate and hostname verification
-            context = ssl.create_default_context()
-            self._mqtt_client.tls_set_context(context)
-
-            self._mqtt_client.connect("mqtt.platform.quboworld.com", 8883, 60)
-            self._mqtt_client.loop_start()
-
-        await self.hass.async_add_executor_job(connect_mqtt)
-
-        # Request metrics immediately, then every 60 seconds
-        await self._send_meter_refresh()
-        self._unsub_refresh = async_track_time_interval(
-            self.hass, self._send_meter_refresh, timedelta(seconds=60)
-        )
-
-    async def stop(self):
-        """Stop the MQTT connection and cancel periodic metric refreshes."""
-        if self._unsub_refresh:
-            self._unsub_refresh()
-        self._mqtt_client.loop_stop()
-        self._mqtt_client.disconnect()
-
-    async def _async_refresh_token_if_needed(self):
-        if time.time() < self._expires_at:
+        except UnicodeError:
+            return
+        if topic not in (
+            self._topic_monitor_switch,
+            self._topic_monitor_meter,
+            self._topic_monitor_heartbeat,
+        ):
+            return
+        if len(msg.payload) > 64 * 1024:
             return
 
-        # (INSERT YOUR EXACT HTTP REFRESH CALL HERE)
-        # self._access_token = new_token
-        # self._expires_at = new_expiration
-        # self._mqtt_client.username_pw_set(username=self._user_uuid, password=self._access_token)
-        # self._mqtt_client.disconnect() # Forces auto-reconnect with new token
-
-        _LOGGER.info("Qubo access token expired. Refreshing")
-
-        # --- YOUR REFRESH API CALL GOES HERE ---
-        refresh_url = f"{BASE_URL}sms/api/v1/sp/d10e4bfb0153496e8e8bb955f7ebe413/users/{self._user_uuid}/auth/refresh"  # Replace with actual Qubo URL
-        payload = {
-            "accessToken": self._access_token,
-            "refreshToken": self._refresh_token,
-        }
-
-        # set the headers as following
-        headers = {
-            "Host": "srvcapp.platform.quboworld.com",
-            "User-Agent": "libcurl-agent restclient-cpp/2:1:1",
-            "Accept": "*/*",
-            "Login-Device-Name": LOGIN_DEVICE_NAME,
-            "Source-Device-Id": self._client_id,  # Use the client_id we saved from the config flow
-            "Token-Type": "USER",
-        }
-
         try:
-            async with self.session.post(
-                refresh_url, json=payload, headers=headers
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
+            payload = json.loads(
+                msg.payload.decode("utf-8"),
+                parse_constant=self._reject_json_constant,
+            )
+            devices = self._mqtt_object(payload, "devices")
+            if topic == self._topic_monitor_heartbeat:
+                if "operationState" not in devices:
+                    return
+                operation_state = devices["operationState"]
+                if operation_state not in ("online", "offline"):
+                    return
+                self.hass.loop.call_soon_threadsafe(
+                    self._apply_mqtt_update, None, {}, operation_state == "online"
+                )
+                return
 
-                # Update our variables with the new data
-                self._access_token = data.get("accessToken")
-                # # Some APIs give you a new refresh token too, some don't.
-                # if "refresh_token" in data:
-                #     self._refresh_token = data.get("refresh_token")
+            service = (
+                "lcSwitchControl"
+                if topic == self._topic_monitor_switch
+                else "plugMetering"
+            )
+            data = self._mqtt_object(
+                devices, "services", service, "events", "stateChanged"
+            )
+            if topic == self._topic_monitor_switch:
+                if "power" not in data or data["power"] not in ("on", "off"):
+                    return
+                state = data["power"] == "on"
+                metrics = {}
+            else:
+                state = None
+                metrics = {}
+                for key in ("power", "current", "voltage", "consumption", "duration"):
+                    if key not in data:
+                        continue
+                    number = self._mqtt_number(data[key])
+                    # Keep the last good voltage for sensor glitches <= 50 V.
+                    if key == "voltage" and number <= 50:
+                        continue
+                    metrics[key] = int(number) if key == "duration" else number
+                if not any(
+                    key in data
+                    for key in ("power", "current", "voltage", "consumption", "duration")
+                ):
+                    return
+        except (UnicodeError, ValueError, TypeError, OverflowError, RecursionError):
+            # No per-message logging: hostile input must not leak payloads or
+            # create an unbounded log flood (even with debug logging enabled).
+            return
 
-                expires_in = data.get("expires_in", 3600)
-                self._expires_at = time.time() + expires_in - 60
+        # Validation completes before queuing one atomic HA-loop update.
+        self.hass.loop.call_soon_threadsafe(
+            self._apply_mqtt_update, state, metrics, True
+        )
 
-                _LOGGER.debug("Token refreshed successfully")
-                # Force MQTT to reconnect with the new password (token)
+    def _apply_mqtt_update(self, state, metrics, available):
+        """Apply a fully validated message and notify only on the HA loop."""
+        if self._phone_auth and (self._reauth_started or self._mqtt_auth_rejected or time.time() >= self._expires_at):
+            return
+        changed = state is not None or bool(metrics) or self.available != available
+        if state is not None:
+            self.state = state
+        self.metrics.update(metrics)
+        self.available = available
+        if changed:
+            self._publish_update()
 
+    async def _async_mqtt_job(self, job):
+        """Keep the lifecycle lock held until a cancelled executor job finishes."""
+        task = asyncio.ensure_future(self.hass.async_add_executor_job(job))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Repeated cancellation must not release the lock while the worker
+            # can still reconnect a client that stop() is about to tear down.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            task.result()
+            raise
 
-                # self._mqtt_client.username_pw_set(
-                #     username=self._user_uuid, password=self._access_token
-                # )
+    async def start(self):
+        """Start MQTT without racing a refresh or an unload."""
+        async with self._lifecycle_lock:
+            if self._phone_auth and time.time() >= self._expires_at:
+                from homeassistant.exceptions import ConfigEntryAuthFailed
+                raise ConfigEntryAuthFailed("Qubo phone session expired")
 
-                # # Disconnecting forces the background loop_start() thread to automatically
-                # # reconnect using the newly set credentials.
-                # self._mqtt_client.disconnect()
+            def connect_mqtt():
+                if not self._mqtt_tls_configured:
+                    context = ssl.create_default_context()
+                    self._mqtt_client.tls_set_context(context)
+                    self._mqtt_tls_configured = True
+                self._mqtt_client.connect("mqtt.platform.quboworld.com", 8883, 60)
+                self._mqtt_client.loop_start()
 
-                # Replace with this proper reboot sequence:
+            await self._async_mqtt_job(connect_mqtt)
+            self._stopped = False
+            if self._unsub_refresh is None:
+                self._unsub_refresh = async_track_time_interval(
+                    self.hass, self._periodic_meter_refresh if self._phone_auth else self._send_meter_refresh, timedelta(seconds=60)
+                )
+
+        if self._phone_auth:
+            await self._periodic_meter_refresh()
+        else:
+            await self._send_meter_refresh()
+
+    async def stop(self):
+        """Serialize teardown with refresh; never join Paho's thread on HA's loop."""
+        async with self._lifecycle_lock:
+            self._stopped = True
+            if self._unsub_refresh:
+                self._unsub_refresh()
+                self._unsub_refresh = None
+
+            def stop_mqtt():
+                self._mqtt_client.disconnect()
+                self._mqtt_client.loop_stop()
+
+            await self._async_mqtt_job(stop_mqtt)
+
+    async def _periodic_meter_refresh(self, now=None):
+        """Keep a quiet timer to retry dismissed reauth flows."""
+        try:
+            await self._send_meter_refresh(now)
+        except QuboHubError:
+            if not self._reauth_started:
+                raise
+
+    async def _expire_phone_session(self):
+        """Disconnect and request a new OTP when credentials cannot be renewed."""
+        if not self._reauth_started:
+            self._reauth_started = True
+            self.available = False
+            self._publish_update()
+            def disconnect():
+                try:
+                    self._mqtt_client.disconnect()
+                finally:
+                    self._mqtt_client.loop_stop()
+            try:
+                await self._async_mqtt_job(disconnect)
+            except (OSError, RuntimeError):
+                _LOGGER.warning("Unable to disconnect expired Qubo session")
+        # HA deduplicates active flows. Retrying allows recovery if the user
+        # dismissed a flow or entered a different account; no OTP is sent here.
+        now = time.monotonic()
+        if self._last_reauth_attempt is None or now - self._last_reauth_attempt >= 60:
+            self._last_reauth_attempt = now
+            try:
+                self._entry.async_start_reauth(self.hass)
+            except Exception:
+                _LOGGER.exception("Unable to start Qubo reauthentication")
+
+    async def _async_refresh_token_if_needed(self):
+        # The expiry check must be inside the same lock as refresh and teardown:
+        # concurrent commands must not rotate the same refresh token twice.
+        async with self._lifecycle_lock:
+            if self._stopped:
+                raise QuboHubError("Qubo hub is stopped")
+            if self._phone_auth and (self._reauth_started or self._mqtt_auth_rejected):
+                await self._expire_phone_session()
+                raise QuboHubError("Qubo phone session requires reauthentication")
+            if self._auth is not None:
+                if self._access_token != self._auth.access_token:
+                    self._mqtt_needs_restart = True
+                self._access_token = self._auth.access_token
+                self._refresh_token = self._auth.refresh_token
+                self._expires_at = self._auth.expires_at
+            if self._phone_auth and time.time() >= self._expires_at and not self._refresh_token:
+                await self._expire_phone_session()
+                raise QuboHubError("Qubo phone session requires reauthentication")
+            if time.time() < self._expires_at and not self._mqtt_needs_restart:
+                return
+
+            try:
+                if time.time() >= self._expires_at:
+                    _LOGGER.info("Qubo access token expired. Refreshing")
+                    access_token, refresh_token, expires_at = await refresh_credentials(
+                        self.session, self._user_uuid, self._client_id,
+                        self._access_token, self._refresh_token, now=time.time(), phone=self._phone_auth,
+                    )
+                    if self._phone_auth:
+                        persist_phone_session(self.hass, self._entry, access_token, refresh_token, expires_at)
+                    self._access_token = access_token
+                    self._refresh_token = refresh_token
+                    self._expires_at = expires_at
+                    if self._auth is not None:
+                        self._auth.access_token = access_token
+                        self._auth.refresh_token = refresh_token
+                        self._auth.expires_at = expires_at
+                    self._mqtt_needs_restart = True
+
                 def restart_mqtt():
-                    """Safely reboot the MQTT client in a background thread."""
-                    _LOGGER.debug("Rebooting MQTT client with new token")
-                    self._mqtt_client.loop_stop()     # Kill the dead thread
-                    self._mqtt_client.disconnect()    # Ensure socket is closed
-
-                    # Apply new credentials and reconnect
-                    self._mqtt_client.username_pw_set(username=self._user_uuid, password=self._access_token)
+                    self._mqtt_client.disconnect()
+                    self._mqtt_client.loop_stop()
+                    self._mqtt_client.username_pw_set(
+                        username=self._user_uuid, password=self._access_token
+                    )
                     self._mqtt_client.connect("mqtt.platform.quboworld.com", 8883, 60)
-                    self._mqtt_client.loop_start()    # Start the fresh thread
-                    _LOGGER.info("MQTT connection successfully restored")
+                    self._mqtt_client.loop_start()
 
-                # Send this blocking sequence to the safe executor pool
-                await self.hass.async_add_executor_job(restart_mqtt)
+                await self._async_mqtt_job(restart_mqtt)
+                self._mqtt_needs_restart = False
+            except SessionRejected:
+                if self._phone_auth:
+                    await self._expire_phone_session()
+                raise QuboHubError("Qubo session refresh rejected") from None
+            except (
+                aiohttp.ClientError, TimeoutError, ValueError, TypeError,
+                OSError, RuntimeError,
+            ):
+                # Do not leak response bodies/tokens or allow commands to proceed
+                # after an HTTP, validation, or MQTT restart failure.
+                raise QuboHubError("Unable to refresh Qubo connection") from None
 
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Failed to refresh Qubo token: %s", err)
 
     async def turn_on(self):
         """Turn on the device."""
